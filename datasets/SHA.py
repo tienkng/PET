@@ -17,17 +17,36 @@ class SHA(Dataset):
         
         prefix = "train_data" if train else "test_data"
         self.prefix = prefix
-        self.img_list = os.listdir(f"{data_root}/{prefix}/images")
-
-        # get image and ground-truth list
+        images_dir = f"{data_root}/{prefix}/images"
+        gt_dir = f"{data_root}/{prefix}/ground_truth"
+        
+        # Kiểm tra thư mục tồn tại
+        import os
+        if not os.path.exists(images_dir):
+            raise FileNotFoundError(f"Images directory not found: {images_dir}")
+        if not os.path.exists(gt_dir):
+            raise FileNotFoundError(f"Ground truth directory not found: {gt_dir}")
+        
+        # Lấy danh sách file ảnh
+        self.img_list = []
         self.gt_list = {}
-        for img_name in self.img_list:
-            img_path = f"{data_root}/{prefix}/images/{img_name}"  
-            gt_path = f"{data_root}/{prefix}/ground-truth/GT_{img_name}"
-            self.gt_list[img_path] = gt_path.replace("jpg", "mat")
-        self.img_list = sorted(list(self.gt_list.keys()))
+        for img_name in os.listdir(images_dir):
+            if not img_name.lower().endswith(('.jpg', '.png')):  # Chỉ lấy file ảnh
+                continue
+            img_path = f"{images_dir}/{img_name}"
+            gt_path = f"{gt_dir}/GT_{img_name}".replace('.jpg', '.mat').replace('.png', '.mat')
+            if os.path.exists(img_path) and os.path.exists(gt_path):
+                self.img_list.append(img_path)
+                self.gt_list[img_path] = gt_path
+            else:
+                print(f"Warning: Skipping {img_path} or {gt_path} because file does not exist")
+        
+        self.img_list = sorted(self.img_list)
         self.nSamples = len(self.img_list)
-
+        
+        if self.nSamples == 0:
+            raise ValueError(f"No valid image-ground truth pairs found in {images_dir}")
+        
         self.transform = transform
         self.train = train
         self.flip = flip
@@ -100,9 +119,27 @@ class SHA(Dataset):
 
 def load_data(img_gt_path, train):
     img_path, gt_path = img_gt_path
+    import os
+    # Kiểm tra file tồn tại
+    if not os.path.exists(img_path):
+        raise FileNotFoundError(f"Image file not found: {img_path}")
+    if not os.path.exists(gt_path):
+        raise FileNotFoundError(f"Ground truth file not found: {gt_path}")
+    
+    # Đọc ảnh
     img = cv2.imread(img_path)
+    if img is None:
+        raise ValueError(f"Failed to load image (possibly corrupted): {img_path}")
+    
+    # Chuyển đổi màu sắc
     img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-    points = io.loadmat(gt_path)['image_info'][0][0][0][0][0][:,::-1]
+    
+    # Đọc ground truth
+    try:
+        points = io.loadmat(gt_path)['image_info'][0][0][0][0][0][:,::-1]
+    except Exception as e:
+        raise ValueError(f"Failed to load ground truth file {gt_path}: {e}")
+    
     return img, points
 
 

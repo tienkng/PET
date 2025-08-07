@@ -1,0 +1,6 @@
+ggdrive: https://drive.google.com/drive/folders/13U-8lb1n9Rf1hqCDZ7nBuNppU7VjXQYy
+
+
+pc1: /home/tiennv/FPT/yolov9/counting_people/PET/PET/weight/JHU_Crowd.pth
+/home/tiennv/FPT/yolov9/counting_people/PET/PET/weight/model.onnx
+/home/tiennv/FPT/yolov9/counting_people/PET/PET/weight/vgg16_bn-6c64b313.pth

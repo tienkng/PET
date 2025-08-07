@@ -287,6 +287,7 @@ class NestedTensor(object):
         return str(self.tensors)
 
 
+
 def nested_tensor_from_tensor_list(tensor_list: List[Tensor]):
     # TODO make this more general
     if tensor_list[0].ndim == 3:

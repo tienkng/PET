@@ -68,7 +68,7 @@ def get_args_parser():
     # misc parameters
     parser.add_argument('--output_dir', default='',
                         help='path where to save, empty for no saving')
-    parser.add_argument('--device', default='cuda',
+    parser.add_argument('--device', default='mps',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--resume', default='', help='resume from checkpoint')
@@ -88,6 +88,7 @@ def get_args_parser():
 def main(args):
     utils.init_distributed_mode(args)
     print(args)
+    args.device = 'cpu'
     device = torch.device(args.device)
 
     # fix the seed for reproducibility

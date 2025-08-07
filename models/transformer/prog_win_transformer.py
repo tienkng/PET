@@ -103,6 +103,8 @@ class WinDecoderTransformer(nn.Module):
         hs = torch.vstack([hs_t.unsqueeze(0) for hs_t in hs_tmp])
         return hs
     
+    
+    
     def decoder_forward_dynamic(self, query_feats, query_embed, memory_win, pos_embed_win, mask_win, dec_win_h, dec_win_w, src_shape, **kwargs):
         """ 
         decoder forward during inference

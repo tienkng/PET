@@ -124,3 +124,6 @@ outputs/
 data/
 tmp/
 pretrained/
+onnx_img_inference_output/
+test1_time_1/
+weight/
