@@ -1,163 +1,166 @@
-import argparse
 import os
-import time
 import numpy as np
 from PIL import Image
 import cv2
 import onnxruntime as ort
 import torch
 import torchvision.transforms as standard_transforms
-import logging
-def get_args_parser():
-    """Parse command-line arguments for ONNX inference script."""
-    parser = argparse.ArgumentParser("ONNX inference for Point Query Transformer", add_help=False)
-    parser.add_argument("--onnx_model", default="model.onnx", type=str, help="Path to ONNX model")
-    parser.add_argument("--img_folder", default="", type=str, help="Folder containing images for inference")
-    parser.add_argument("--vis_dir", default="", type=str, help="Directory to save visualized images")
-    parser.add_argument("--device", default="cpu", type=str, help="Device to use for preprocessing (cpu or cuda)")
-    parser.add_argument("--input_height", default=512, type=int, help="Height of resized input images")
-    parser.add_argument("--input_width", default=1024, type=int, help="Width of resized input images")
-    parser.add_argument("--num_workers", default=2, type=int, help="Number of workers for data loading")
-    parser.add_argument('--providers', help='ONNX runtime providers (comma-separated)', 
-                       default='CUDAExecutionProvider,CPUExecutionProvider', type=str)
-    return parser
 
-class DeNormalize:
-    """Denormalize a tensor image with given mean and std."""
-    def __init__(self, mean, std):
-        self.mean = mean
-        self.std = std
+NORM_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+NORM_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-    def __call__(self, tensor):
-        for t, m, s in zip(tensor, self.mean, self.std):
-            t.mul_(s).add_(m)
-        return tensor
+def softmax(x: np.ndarray, axis: int = -1):
+    """Equivalent to torch.nn.functional.softmax()."""
+    e_x = np.exp(x - np.max(x, axis=axis, keepdims=True))
+    return e_x / np.sum(e_x, axis=axis, keepdims=True)
 
-def nested_tensor_from_tensor_list(tensor_list, device):
-    """Convert a list of tensors to a NestedTensor with padding and mask."""
-    if tensor_list[0].ndim == 3:
-        max_size = [max(s) for s in zip(*[img.shape for img in tensor_list])]
-        batch_shape = [len(tensor_list)] + max_size
-        b, c, h, w = batch_shape
-        dtype = tensor_list[0].dtype
-        tensor = torch.zeros(batch_shape, dtype=dtype, device=device)
-        mask = torch.ones((b, h, w), dtype=torch.bool, device=device)
-        for img, pad_img, m in zip(tensor_list, tensor, mask):
-            pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
-            m[: img.shape[1], : img.shape[2]] = False
-    else:
-        raise ValueError("Only 3D tensors are supported")
-    return tensor, mask
+class PETModel:
+    def __init__(self, model_path="model.onnx", device="cuda", input_size=(512, 1024)):
+        """Initialize the PET model for ONNX inference."""
+        self.device = torch.device("cuda" if device == "cuda" and torch.cuda.is_available() else "cpu")
+        self.input_size = input_size
+        providers = ["CUDAExecutionProvider"] if self.device.type == "cuda" else ["CPUExecutionProvider"]
+        self.model = ort.InferenceSession(model_path, providers=providers)
+        
+        self.inp_names = [x.name for x in self.model.get_inputs()]
+        self.out_names = [x.name for x in self.model.get_outputs()]
+        
+    def preprocess(self, image: np.ndarray) -> tuple:
+        """Preprocess image for ONNX inference.
 
-def visualization(image_orig, pred_points, orig_size, vis_dir, img_path):
-    """Visualize predictions by drawing points on the original image and save the result."""
-    pil_to_tensor = standard_transforms.ToTensor()
-    restore_transform = standard_transforms.Compose([
-        DeNormalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        standard_transforms.ToPILImage(),
-    ])
+        Args:
+            image (np.ndarray): Input image in shape (H, W, C) - OpenCV format.
 
-    # Denormalize and convert to numpy
-    sample = restore_transform(image_orig)
-    sample = pil_to_tensor(sample.convert("RGB")).numpy() * 255
-    sample_vis = sample.transpose([1, 2, 0])[:, :, ::-1].astype(np.uint8).copy()
+        Returns:
+            tuple: (input_tensor, input_mask, normalized_image, original_size)
+        """
+        orig_h, orig_w = image.shape[:2]
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        transform = standard_transforms.Compose([
+            standard_transforms.ToPILImage(),
+            standard_transforms.Resize(self.input_size),
+            standard_transforms.ToTensor(),
+            standard_transforms.Normalize(mean=NORM_MEAN, std=NORM_STD),
+        ])
+        norm_image = transform(image_rgb).to(self.device)
 
-    # Resize back to original size
-    orig_h, orig_w = orig_size
-    sample_vis = cv2.resize(sample_vis, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+        tensor, mask = self.nested_tensor_from_tensor_list([norm_image], self.device)
+        return tensor.cpu().numpy(), mask.cpu().numpy(), norm_image, (orig_h, orig_w)
 
-    # Draw predictions (green) on original size
-    size = 6
-    for p in pred_points:
-        x = int(p[1] * orig_w)  # Scale x-coordinate
-        y = int(p[0] * orig_h)  # Scale y-coordinate
-        sample_vis = cv2.circle(sample_vis, (x, y), size, (0, 255, 0), -1)
+    @staticmethod
+    def nested_tensor_from_tensor_list(tensor_list, device):
+        """Convert a list of tensors to a NestedTensor with padding and mask."""
+        if tensor_list[0].ndim == 3:
+            max_size = [max(s) for s in zip(*[img.shape for img in tensor_list])]
+            batch_shape = [len(tensor_list)] + max_size
+            b, _, h, w = batch_shape
+            dtype = tensor_list[0].dtype
+            tensor = torch.zeros(batch_shape, dtype=dtype, device=device)
+            mask = torch.ones((b, h, w), dtype=torch.bool, device=device)
+            for img, pad_img, m in zip(tensor_list, tensor, mask):
+                pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
+                m[: img.shape[1], : img.shape[2]] = False
+        else:
+            raise ValueError("Only 3D tensors are supported")
+        return tensor, mask
 
-    # Save image
-    if vis_dir:
-        os.makedirs(vis_dir, exist_ok=True)
-        name = os.path.splitext(os.path.basename(img_path))[0]
-        img_save_path = os.path.join(vis_dir, f"{name}.jpg")
-        cv2.imwrite(img_save_path, sample_vis)
-        print(f"Image saved to {img_save_path}")
+    def postprocess(self, predict, threshold=0.5):
+        """Postprocess predictions to get points and count.
 
-def evaluate_folder(onnx_model_path, img_folder, device, vis_dir=None, input_size=(512, 1024)):
+        Args:
+            predict (list): [pred_logits, pred_points] from ONNX model.
+            threshold (float): Confidence threshold for filtering points.
 
-    """Evaluate the ONNX model on all images in a folder and print model inference time."""
-    if str(device) == "cuda" and torch.cuda.is_available():
-        providers = ["CUDAExecutionProvider"]
-    else:
-        providers = ["CPUExecutionProvider"]
-    session = ort.InferenceSession(onnx_model_path, providers=providers) # CPUExecutionProvider and CUDAExecutionProvider
+        Returns:
+            tuple: (points, point_count)
+        """
+        pred_logits = torch.from_numpy(predict[0]).to(self.device)  
+        pred_points = torch.from_numpy(predict[1]).to(self.device)  
+        
+        scores = torch.nn.functional.softmax(pred_logits, dim=-1)[:, :, 1][0]  
+        mask = scores > threshold
+        filtered_points = pred_points[0][mask].cpu().numpy()  
+        point_count = len(filtered_points)
+        
+        return filtered_points.tolist(), point_count
 
-    # Get all images in the folder
+    def run(self, image: np.ndarray, threshold: float = 0.5):
+        """Run inference on a single image.
+
+        Args:
+            image (np.ndarray): Input image in shape (H, W, C).
+            threshold (float): Confidence threshold for filtering points.
+
+        Returns:
+            tuple: (points, point_count, normalized_image, original_size)
+        """
+        inp_tensor, inp_mask, norm_image, orig_size = self.preprocess(image)
+        predict = self.model.run(self.out_names, {
+            self.inp_names[0]: inp_tensor,
+            self.inp_names[1]: inp_mask
+        })
+        points, point_count = self.postprocess(predict, threshold)
+        return points, point_count, norm_image, orig_size
+
+    def visualize(self, norm_image: torch.Tensor, points: list, orig_size: tuple, save_path: str = None):
+        """Visualize predictions by drawing points on the image.
+
+        Args:
+            norm_image (torch.Tensor): Normalized image tensor [3, H, W].
+            points (list): List of [y, x] points (normalized).
+            orig_size (tuple): (orig_h, orig_w) of original image.
+            save_path (str, optional): Path to save visualized image.
+        """
+        orig_h, orig_w = orig_size
+        restore_transform = standard_transforms.Compose([
+            standard_transforms.Normalize(mean=[-m/s for m, s in zip(NORM_MEAN, NORM_STD)], std=[1/s for s in NORM_STD]),
+            standard_transforms.ToPILImage(),
+        ])
+        
+        img = restore_transform(norm_image.cpu())
+        img = standard_transforms.ToTensor()(img.convert("RGB")).numpy() * 255
+        img_vis = img.transpose([1, 2, 0])[:, :, ::-1].astype(np.uint8).copy()
+        
+        img_vis = cv2.resize(img_vis, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+        
+        for p in points:
+            x = int(p[1] * orig_w)  
+            y = int(p[0] * orig_h)  
+            if 0 <= x < orig_w and 0 <= y < orig_h:  
+                img_vis = cv2.circle(img_vis, (x, y), 8, (0, 255, 0), -1)
+
+        if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            cv2.imwrite(save_path, img_vis)
+        return img_vis
+
+def main():
+    model_path = "/home/tiennv/FPT/yolov9/counting_people/PET/PET/weight/model_simp_clean.onnx"
+    img_folder = "/home/tiennv/FPT/yolov9/PET/data4render/images"
+    vis_dir = "onnx_img_output"
+    device = "cuda"
+    input_size = (512, 1024)
+    threshold = 0.5
+
+    os.makedirs(vis_dir, exist_ok=True)
+    model = PETModel(model_path, device, input_size)
+    
     img_names = [f for f in os.listdir(img_folder) if f.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"))]
-    if not img_names:
-        raise FileNotFoundError(f"No valid images found in {img_folder}")
-
-    transform = standard_transforms.Compose([
-        standard_transforms.Resize(input_size),
-        standard_transforms.ToTensor(),
-        standard_transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-
+    
     for img_name in img_names:
         img_path = os.path.join(img_folder, img_name)
-        try:
-            # Load original image to get size
-            img_orig = cv2.imread(img_path)
-            if img_orig is None:
-                print(f"Could not load image at {img_path}")
-                continue
-            orig_h, orig_w = img_orig.shape[:2]
-            img = Image.fromarray(cv2.cvtColor(img_orig, cv2.COLOR_BGR2RGB))
-            img = transform(img)
-            img = img.to(device)
-            tensors, mask = nested_tensor_from_tensor_list([img], device)
-            
-            # Run inference with ONNX and measure only model inference time
-            start_time = time.time()
-            outputs = session.run(None, {
-                'input_tensors': tensors.cpu().numpy(),
-                'input_mask': mask.cpu().numpy()
-            })
-            end_time = time.time()
-            inference_time = end_time - start_time
-
-            print(f"Model inference time for {img_name}: {inference_time:.4f} seconds")
-
-            # Process predictions for visualization
-            pred_logits = torch.from_numpy(outputs[0]).to(device)  # Shape: [1, num_queries, 2]
-            pred_points = torch.from_numpy(outputs[1]).to(device)  # Shape: [1, num_queries, 2]
-            outputs_scores = torch.nn.functional.softmax(pred_logits, -1)[:, :, 1][0]  # Positive class scores
-            outputs_points = pred_points[0]  # Shape: [num_queries, 2]
-
-            if vis_dir:
-                # Scale points back to original size (handled in visualization)
-                points = [[point[0], point[1]] for point in outputs_points]  # Keep normalized coordinates
-                visualization(img, points, (orig_h, orig_w), vis_dir, img_path)
-
-        except Exception as e:
-            print(f"Error processing {img_path}: {e}")
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"Could not load image at {img_path}")
             continue
-
-def main(args):
-    """Main function to run ONNX inference."""
-    if not os.path.exists(args.img_folder):
-        raise FileNotFoundError(f"Image folder {args.img_folder} does not exist")
-    if not os.path.exists(args.onnx_model):
-        raise FileNotFoundError(f"ONNX model file {args.onnx_model} does not exist")
-
-    device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    vis_dir = args.vis_dir if args.vis_dir else None
-    input_size = (args.input_height, args.input_width)
-    evaluate_folder(
-        args.onnx_model, args.img_folder, device, vis_dir, input_size
-    )
+            
+        points, point_count, norm_image, orig_size = model.run(img, threshold)
+        print(f"Image path: {img_path}\tCount: {point_count}")
+            
+        if vis_dir:
+            save_path = os.path.join(vis_dir, f"{os.path.splitext(img_name)[0]}.jpg")
+            model.visualize(norm_image, points, orig_size, save_path)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser("ONNX inference script", parents=[get_args_parser()])
-    args = parser.parse_args()
-    main(args)
+    main()
+            
