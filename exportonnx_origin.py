@@ -7,11 +7,8 @@ import torch
 from torch import Tensor
 import numpy as np
 import torch.nn as nn
+from torch.utils.data import DataLoader, DistributedSampler
 import torch.onnx
-import onnx
-import onnx.checker
-from onnxsim import simplify
-import logging
 
 import datasets
 from datasets import build_dataset
@@ -19,14 +16,11 @@ import util.misc as utils
 from engine import evaluate
 from models import build_model
 
-# Thiết lập logging
-logging.basicConfig(level=logging.INFO)
-LOGGER = logging.getLogger(__name__)
 
 def get_args_parser():
-    parser = argparse.ArgumentParser('Set Point Query Transformer with ONNX export and simplification', add_help=False)
+    parser = argparse.ArgumentParser('Set Point Query Transformer', add_help=False)
 
-    # Model parameters
+    # model parameters
     parser.add_argument('--backbone', default='vgg16_bn', type=str,
                         help="Name of the convolutional backbone to use")
     parser.add_argument('--position_embedding', default='sine', type=str, choices=('sine', 'learned', 'fourier'),
@@ -42,7 +36,7 @@ def get_args_parser():
     parser.add_argument('--nheads', default=8, type=int,
                         help="Number of attention heads inside the transformer's attentions")
     
-    # Loss parameters
+    # loss parameters
     parser.add_argument('--set_cost_class', default=1, type=float,
                         help="Class coefficient in the matching cost")
     parser.add_argument('--set_cost_point', default=0.05, type=float,
@@ -52,11 +46,11 @@ def get_args_parser():
     parser.add_argument('--eos_coef', default=0.5, type=float,
                         help="Relative classification weight of the no-object class")
 
-    # Dataset parameters
+    # dataset parameters
     parser.add_argument('--dataset_file', default="SHA")
     parser.add_argument('--data_path', default="./data/ShanghaiTech/PartA", type=str)
 
-    # Misc parameters
+    # misc parameters
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=42, type=int)
@@ -65,11 +59,6 @@ def get_args_parser():
     parser.add_argument('--num_workers', default=2, type=int)
     parser.add_argument('--onnx_output', default='model.onnx', type=str,
                         help='Path to save the exported ONNX model')
-    parser.add_argument('--keep_node_name', nargs='+', type=str, default=['pred_logits', 'pred_points'],
-                        help='List of output node names to keep in the ONNX model')
-    parser.add_argument('--simplify', action='store_true',
-                        help='Whether to simplify the ONNX model using onnx-simplifier')
-    
     return parser
 
 
@@ -98,60 +87,22 @@ class ModelWrapper(nn.Module):
     def forward(self, tensors, mask):
         samples = utils.NestedTensor(tensors, mask)
         outputs = self.model(samples, test=True)
-        return (outputs['pred_logits'], outputs['pred_points'])
-
-
-def check_onnx_model(onnx_file_path):
-    """Check the validity of the ONNX model."""
-    try:
-        model = onnx.load(onnx_file_path)
-        onnx.checker.check_model(model)
-        LOGGER.info(f"ONNX model at {onnx_file_path} is valid")
-    except Exception as e:
-        LOGGER.error(f"ONNX model check failed: {e}")
-        raise
-
-
-def clean_onnx_model(onnx_file_path, keep_node_name):
-    """Clean the ONNX model by keeping only specified output nodes."""
-    if not keep_node_name:
-        raise ValueError("Provide at least one node name to keep")
-    
-    model = onnx.load(onnx_file_path)
-    
-    LOGGER.info("\t====== Original outputs ======")
-    for output in model.graph.output:
-        LOGGER.info(str(output))
-
-    # Keep only specified outputs
-    nodes = [output for output in model.graph.output if output.name in keep_node_name]
-
-    # Remove all existing outputs and add back the ones to keep
-    del model.graph.output[:]
-    model.graph.output.extend(nodes)
-    
-    LOGGER.info("\t====== Remaining outputs ======")
-    for output in model.graph.output:
-        LOGGER.info(str(output))
-        
-    # Save the cleaned model
-    onnx.save(model, onnx_file_path)
-    LOGGER.info(f"Cleaned ONNX model saved to {onnx_file_path}")
-    check_onnx_model(onnx_file_path)
+        # Only return the dynamic tensor outputs for ONNX
+        return (outputs['pred_logits'], outputs['pred_points'], outputs['pred_offsets'], outputs['split_map_raw'])
 
 
 def main(args):
     utils.init_distributed_mode(args)
-    LOGGER.info(args)
+    print(args)
     device = torch.device(args.device)
 
-    # Fix the seed for reproducibility
+    # fix the seed for reproducibility
     seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
 
-    # Build model
+    # build model
     model, criterion = build_model(args)
     model.to(device)
 
@@ -160,9 +111,9 @@ def main(args):
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    LOGGER.info(f'params: {n_parameters/1e6}M')
+    print('params:', n_parameters/1e6)
 
-    # Load pretrained model
+    # load pretrained model
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -171,19 +122,21 @@ def main(args):
             checkpoint = torch.load(args.resume, map_location='cpu')
         model_without_ddp.load_state_dict(checkpoint['model'])        
     
-    # Export to ONNX
+    # export to ONNX
     model.eval()
-    dummy_images = [torch.randn(3, 512, 1024, dtype=torch.float32, device=device)]
+    # Create a dummy input with adjusted size
+    dummy_images = [torch.randn(3, 512, 1024, dtype=torch.float32, device=device)]  # Adjusted size
     dummy_nested_tensor = nested_tensor_from_tensor_list(dummy_images)
-    dummy_tensors = dummy_nested_tensor.tensors
-    dummy_mask = dummy_nested_tensor.mask
+    dummy_tensors = dummy_nested_tensor.tensors  # Shape: [1, 3, 512, 1024]
+    dummy_mask = dummy_nested_tensor.mask  # Shape: [1, 512, 1024]
 
+    # Wrap the model to accept tensors and mask separately
     wrapped_model = ModelWrapper(model_without_ddp)
     
     # Debug: Test the model output
     with torch.no_grad():
         outputs = wrapped_model(dummy_tensors, dummy_mask)
-        LOGGER.info("Model outputs: %s", [out.shape if isinstance(out, torch.Tensor) else out for out in outputs])
+        print("Model outputs:", [out.shape if isinstance(out, torch.Tensor) else out for out in outputs])
 
     # Export the model to ONNX
     torch.onnx.export(
@@ -194,43 +147,20 @@ def main(args):
         opset_version=11,
         do_constant_folding=True,
         input_names=['input_tensors', 'input_mask'],
-        output_names=['pred_logits', 'pred_points'],
+        output_names=['pred_logits', 'pred_points', 'pred_offsets', 'split_map_raw'],
         dynamic_axes={
             'input_tensors': {0: 'batch_size', 2: 'height', 3: 'width'},
             'input_mask': {0: 'batch_size', 1: 'height', 2: 'width'},
             'pred_logits': {0: 'batch_size'},
             'pred_points': {0: 'batch_size'},
+            'pred_offsets': {0: 'batch_size'},
+            'split_map_raw': {0: 'batch_size'}
         }
     )
-    LOGGER.info(f"Model exported to {args.onnx_output}")
-    check_onnx_model(args.onnx_output)
-
-    # Simplify the ONNX model if requested
-    if args.simplify:
-        try:
-            cuda = torch.cuda.is_available()
-            try:
-                from importlib.metadata import version
-                onnxsim_version = version('onnx-simplifier')
-            except:
-                onnxsim_version = 'unknown'
-            LOGGER.info(f"Simplifying with onnx-simplifier {onnxsim_version}...")
-            model_onnx = onnx.load(args.onnx_output)
-            model_onnx, check = simplify(model_onnx, check_n=3, dynamic_input_shape=True)
-            if not check:
-                LOGGER.error("ONNX simplifier check failed")
-                return
-            onnx.save(model_onnx, args.onnx_output)
-            LOGGER.info(f"Simplified ONNX model saved to {args.onnx_output}")
-            check_onnx_model(args.onnx_output)
-        except Exception as e:
-            LOGGER.error(f"Simplifier failure: {e}")
-
-    # Clean the ONNX model to keep only specified outputs
-    clean_onnx_model(args.onnx_output, args.keep_node_name)
+    print(f"Model exported to {args.onnx_output}")
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser('PET evaluation script with ONNX export and simplification', parents=[get_args_parser()])
+    parser = argparse.ArgumentParser('PET evaluation script with ONNX export', parents=[get_args_parser()])
     args = parser.parse_args()
     main(args)
